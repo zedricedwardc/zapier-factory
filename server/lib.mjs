@@ -25,14 +25,24 @@ export class ZapierError extends Error {
 // HARD READ-ONLY GUARD — the single place that decides whether a request may leave this process.
 // Allowed: GET to https://zapier.com/..., and POST to /api/reporting/graphql whose JSON body is a
 // single operation with query text starting with `query` and containing no `mutation`/`subscription`.
+// ONE exception (owner's decision, 2026-11-12): the trpc token renewal, POST https://zapier.com/api/v4/jwt/refresh,
+// exact path, no query string, no body — exactly what the zapier.com app sends. It renews the session's
+// short-lived (~15 min) asset-management token and changes no Zap, run or setting.
 // Everything else throws READ_ONLY_VIOLATION.
 // ---------------------------------------------------------------------------------------------
 export const GRAPHQL_PATH = '/api/reporting/graphql';
+export const JWT_REFRESH_PATH = '/api/v4/jwt/refresh';
+// The exact text only (full URL or bare path), so no dot-segment, percent-escape, port or case variant passes.
+const isJwtRefresh = (rawUrl, u) => u.pathname === JWT_REFRESH_PATH && [ORIGIN + JWT_REFRESH_PATH, JWT_REFRESH_PATH].includes(String(rawUrl));
 export function assertReadOnly(method, url, body) {
   const m = String(method || '').toUpperCase();
   let u;
   try { u = new URL(url, ORIGIN); } catch { throw new ZapierError('READ_ONLY_VIOLATION', `unparseable URL ${url}`); }
   if (u.origin !== ORIGIN) throw new ZapierError('READ_ONLY_VIOLATION', `only ${ORIGIN} is allowed, got ${u.origin}`);
+  if (m === 'POST' && isJwtRefresh(url, u)) {
+    if (body !== undefined && body !== null) throw new ZapierError('READ_ONLY_VIOLATION', `${JWT_REFRESH_PATH} is sent without a body (as the zapier.com app does)`);
+    return true;
+  }
   // Switching the current Zapier account is a write on the server side, whatever the method.
   let decoded = u.pathname;
   try { decoded = decodeURIComponent(u.pathname); } catch { /* keep raw */ }
@@ -88,6 +98,9 @@ function loadSession(login) {
   }
   return state.data;
 }
+
+// Bumps whenever the session file is (re)loaded from disk (a new login), not when rotated cookies are saved.
+export function sessionGen(login) { loadSession(login); return states.get(login).gen; }
 
 function saveSession(login) {
   const state = states.get(login);
@@ -191,7 +204,7 @@ export async function request(login, method, pathOrUrl, { body, referer } = {}) 
   }
   persistRotatedCookies(login, res, new URL(url).hostname);
   const p = new URL(url).pathname;
-  if (res.status === 401 || res.status === 403) throw sessionMissing(login, `Zapier answered ${res.status} on ${p} — the saved browser session is no longer accepted`);
+  if (res.status === 401 || res.status === 403) throw Object.assign(sessionMissing(login, `Zapier answered ${res.status} on ${p} — the saved browser session is no longer accepted`), { status: res.status });
   if (res.status >= 300 && res.status < 400) {
     const loc = res.headers.get('location') || '';
     // The query string can carry tokens or customer data: only the path is ever reported.
@@ -226,9 +239,81 @@ export function qs(params) {
   return out ? '?' + out : '';
 }
 
-// tRPC (asset-management-bff) — GET with ?input=<json>
+// ---------------------------------------------------------------------------------------------
+// trpc token. The asset-management tRPC service (folders, folder assets, zap.searchZaps, connections,
+// tables) authenticates with a short-lived (~15 min) JWT cookie, not the Django session that REST and
+// GraphQL use. The zapier.com app renews it with POST /api/v4/jwt/refresh (no body, X-CSRFToken header;
+// 200 or 429 = ok), captured from its page scripts 2026-11-12. We send that same request only when the
+// token is expired (a trpc 401, or session-cookie-status 401), once per expiry, and persist the renewed
+// cookies through the normal Set-Cookie path. Results only ever say "renewed at <time>".
+// ---------------------------------------------------------------------------------------------
+export const SESSION_COOKIE_STATUS_PATH = '/api/bridge/session-cookie-status';
+const renewing = new Map(); // login -> in-flight renewal promise (one at a time, like the app)
+const renewals = new Map(); // login -> ISO times not yet reported
+export const STILL_WORKS = 'search_runs, list_runs_rest, get_run, contact_runs, get_zap, list_zap_versions, get_zap_version, held_counts, step_gives, list_members, task_usage, list_apps';
+export function trpcExpired(login, why) {
+  return new ZapierError('TRPC_TOKEN_EXPIRED', `[login ${login}] the folder/Zap-list (trpc) token expired and could not be renewed (${why}). `
+    + `Still working (session + GraphQL/REST): ${STILL_WORKS}. For folders, folder assets, the trpc Zap list, connections and tables, run \`node login.mjs ${login}\` in the zapier-factory server folder, then retry.`, { login });
+}
+
+async function sendRenewal(login) {
+  const url = ORIGIN + JWT_REFRESH_PATH;
+  assertReadOnly('POST', url, undefined);
+  const cookie = cookieHeader(login, url);
+  if (!cookie) throw sessionMissing(login, 'session file holds no zapier.com cookies');
+  const csrf = cookieValue(login, url, 'csrftoken');
+  if (!csrf) return { ok: false, why: 'no csrftoken cookie in the saved session' };
+  const headers = { accept: '*/*', cookie, 'user-agent': userAgent(login), origin: ORIGIN, referer: `${ORIGIN}/app/assets/zaps`, 'x-csrftoken': csrf };
+  let res;
+  try { res = await fetch(url, { method: 'POST', headers, redirect: 'manual', signal: AbortSignal.timeout(30_000) }); }
+  catch (e) { return { ok: false, why: `network: ${e.message}` }; }
+  persistRotatedCookies(login, res, new URL(url).hostname);
+  try { await res.text(); } catch { /* body unused */ }
+  const ok = res.status === 200 || res.status === 429;
+  if (ok) { const at = new Date().toISOString(); renewals.set(login, [...(renewals.get(login) || []), at]); return { ok, at, status: res.status }; }
+  return { ok: false, why: `renewal answered ${res.status}` };
+}
+// One renewal per expiry: a result younger than RENEWAL_REUSE_MS is reused instead of sending another POST
+// (a failed renewal is not retried in a loop; a token still refused right after a renewal is reported as expired).
+export const RENEWAL_REUSE_MS = 30_000;
+const lastRenewal = new Map(); // login -> { at, result }
+export function _resetRenewalCache() { lastRenewal.clear(); renewals.clear(); }
+export function renewTrpcToken(login) {
+  const last = lastRenewal.get(login);
+  if (last && Date.now() - last.at < RENEWAL_REUSE_MS) return Promise.resolve(last.result);
+  if (!renewing.has(login)) {
+    renewing.set(login, sendRenewal(login).then((result) => { lastRenewal.set(login, { at: Date.now(), result }); return result; }).finally(() => renewing.delete(login)));
+  }
+  return renewing.get(login);
+}
+// Renewal times since the last call, for the result's warnings ("renewed at <time>").
+export function takeRenewals(login) { const r = renewals.get(login) || []; renewals.delete(login); return r; }
+
+// GET /api/bridge/session-cookie-status: 200 while the trpc token is valid, 401 once it expired (live 2026-11-12).
+async function trpcTokenStatus(login) {
+  try { await get(login, SESSION_COOKIE_STATUS_PATH); return 'valid'; }
+  catch (e) { if (e.status === 401 || e.status === 403) return 'expired'; throw e; }
+}
+// 'valid' | 'expired'; renews once when expired.
+export async function checkTrpcToken(login) {
+  if (await trpcTokenStatus(login) === 'valid') return { trpc_token: 'valid' };
+  const r = await renewTrpcToken(login);
+  if (r.ok && await trpcTokenStatus(login) === 'valid') return { trpc_token: 'valid' };
+  return { trpc_token: 'expired', why: r.ok ? 'still expired after renewal' : r.why };
+}
+
+// tRPC (asset-management-bff) — GET with ?input=<json>. A 401/403 renews the token once and retries once.
 export async function trpc(login, proc, input = {}) {
-  const r = await get(login, `/api/asset-management-bff/trpc/${proc}?input=${encodeURIComponent(JSON.stringify(input))}`);
+  const p = `/api/asset-management-bff/trpc/${proc}?input=${encodeURIComponent(JSON.stringify(input))}`;
+  let r;
+  try { r = await get(login, p); }
+  catch (e) {
+    if (!(e.code === 'SESSION_EXPIRED' && (e.status === 401 || e.status === 403))) throw e;
+    const ren = await renewTrpcToken(login);
+    if (!ren.ok) throw trpcExpired(login, ren.why);
+    try { r = await get(login, p); }
+    catch (e2) { if (e2.code === 'SESSION_EXPIRED' && e2.status) throw trpcExpired(login, `still ${e2.status} after renewal`); throw e2; }
+  }
   const data = r?.result?.data;
   return data && typeof data === 'object' && 'json' in data && Object.keys(data).length <= 2 ? data.json : data;
 }
@@ -298,30 +383,28 @@ export async function assertSessionMatchesRegistry(login) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Runs GraphQL query (ZapRuns). Variables with proven types come from the saved history-page query;
-// the other variables the audit found are added only when used, with types NOT confirmed
-// (introspection is off) — if Zapier rejects a type, the GraphQL error is returned as is.
+// Runs GraphQL query (ZapRuns). Variable types are copied from the zapier.com history page's own ZapRuns
+// text (captured 2026-11-12); each variable is declared only when used.
 // ---------------------------------------------------------------------------------------------
-const RUN_VAR_TYPES = {
+export const RUN_VAR_TYPES = {
   accountId: 'ID!', limit: 'Int', offset: 'Int', periodEnd: 'String', periodStart: 'String',
   query: 'String', sortBy: 'String', status: '[String!]', zapIds: '[ID!]', folderIds: '[ID!]',
-};
-export const RUN_VAR_TYPES_UNVERIFIED = {
   apps: '[String!]', channel: 'String', channelError: 'String', customuserIds: '[ID!]',
-  heldReasons: '[String!]', heldStaleAuthIds: '[ID!]',
+  heldReasons: '[HeldReason!]', heldStaleAuthIds: '[String!]',
 };
 const EDGE_FIELDS_FULL = 'billableCount hasPaths heldReason heldStaleAuth id startTime status triggerType replayCount zap { id kind sourceUrl title folder { id title } } zapOwner { id name }';
 const EDGE_FIELDS_MIN = 'id startTime status heldReason triggerType replayCount billableCount zap { id title }';
 
 export function buildZapRunsQuery(vars, edgeFields = EDGE_FIELDS_FULL) {
-  const types = { ...RUN_VAR_TYPES, ...RUN_VAR_TYPES_UNVERIFIED };
+  const types = RUN_VAR_TYPES;
   const used = Object.keys(vars).filter(k => vars[k] !== undefined && types[k]);
   const decl = used.map(k => `$${k}: ${types[k]}`).join(', ');
   const args = used.map(k => `${k}: $${k}`).join(', ');
   return `query ZapRuns(${decl}) {\n  zapRuns(${args}) {\n    edges { ${edgeFields} }\n    totalCount\n    totalActionable\n  }\n}`;
 }
 
-export const RUN_STATUSES = ['error', 'error_handled', 'needs_review', 'held', 'throttled', 'halted', 'filtered', 'success', 'delayed', 'scheduled'];
+// UI label map (history bundle): "Running" = pending (and replay, which the API rejects as a filter). running/replay/playing give 400.
+export const RUN_STATUSES = ['error', 'error_handled', 'needs_review', 'held', 'throttled', 'halted', 'filtered', 'success', 'delayed', 'scheduled', 'pending', 'skipped'];
 
 export function defaultPeriod() {
   const now = Date.now();
@@ -353,16 +436,54 @@ export async function zapRuns(login, v = {}) {
 // ---------------------------------------------------------------------------------------------
 // Full-paging helpers
 // ---------------------------------------------------------------------------------------------
-export async function allZaps(login, { search, order = '-updated_at', pageSize = 500 } = {}) {
+// zap.searchZaps (trpc). Filters proven live 2026-11-12: search (text), status 'on' | 'off' (128 + 167 = 295),
+// apps = ONE selected-api id as a string (an array gives 400).
+export async function allZaps(login, { search, status, apps, order = '-updated_at', pageSize = 500 } = {}) {
   const out = []; let count;
+  const filters = { ...(search ? { search } : {}), ...(status ? { status } : {}), ...(apps ? { apps } : {}) };
   for (let offset = 0; ; offset += pageSize) {
-    const p = await trpc(login, 'zap.searchZaps', { limit: pageSize, offset, order, ...(search ? { search } : {}) });
+    const p = await trpc(login, 'zap.searchZaps', { limit: pageSize, offset, order, ...filters });
     const rows = p?.results || [];
     count = p?.count ?? count;
     out.push(...rows);
     if (!p?.next || rows.length < pageSize) break;
   }
   return { count: count ?? out.length, results: out };
+}
+
+// Zaps via the reporting GraphQL (session auth, unaffected by the trpc token). Query texts are the UI's ZapSearch /
+// ZapsById (zapier.com history bundle, 2026-11-12) with `isEnabled` added to the fragment (proven live) and the owner
+// fields dropped. Both return at most 25 edges per call (ZapsById silently caps at 25 ids; >~250 ids gives 400).
+// Zap has no apps / updatedAt / lastRun field here (400), so the trpc list stays the source for those.
+const ZAP_GQL_FIELDS = 'id isEnabled title container @include(if: $includeFolder) { __typename id title }';
+export const ZAP_SEARCH_QUERY = `query ZapSearch( $accountId: ID! $includeFolder: Boolean! $cursor: String $limit: Int $search: String ) { zaps( accountId: $accountId cursor: $cursor limit: $limit title: $search ) { cursor edges { ${ZAP_GQL_FIELDS} } totalCount } }`;
+export const ZAPS_BY_ID_QUERY = `query ZapsById( $accountId: ID! $includeFolder: Boolean! $ids: [ID!]! ) { zaps(accountId: $accountId, ids: $ids) { edges { ${ZAP_GQL_FIELDS} } } }`;
+const gqlZapRow = (e) => ({ id: String(e.id), title: e.title, isEnabled: e.isEnabled ?? null, folder: e.container ? { id: String(e.container.id), title: e.container.title } : null });
+
+// Every Zap of the account (cursor walk, 25 per page): { totalCount, results: [{id, title, isEnabled, folder}], complete }.
+export async function allZapsGql(login, { search, maxPages = 400 } = {}) {
+  const accountId_ = await accountId(login);
+  const out = []; let cursor = null; let totalCount; let pages = 0;
+  do {
+    const r = (await graphql(login, 'ZapSearch', ZAP_SEARCH_QUERY, { accountId: accountId_, includeFolder: true, limit: 25, ...(cursor ? { cursor } : {}), ...(search ? { search } : {}) }))?.zaps;
+    totalCount = r?.totalCount ?? totalCount;
+    const edges = r?.edges || [];
+    out.push(...edges.map(gqlZapRow));
+    cursor = edges.length ? r?.cursor ?? null : null;
+    pages++;
+  } while (cursor && pages < maxPages);
+  return { totalCount: totalCount ?? out.length, results: out, complete: !cursor };
+}
+
+// On/off + folder for given Zap ids: ZapsById in chunks of 25. Returns Map(id -> row).
+export async function zapsById(login, ids) {
+  const accountId_ = await accountId(login);
+  const map = new Map(); const list = [...new Set(ids.map(String))];
+  for (let i = 0; i < list.length; i += 25) {
+    const r = await graphql(login, 'ZapsById', ZAPS_BY_ID_QUERY, { accountId: accountId_, includeFolder: true, ids: list.slice(i, i + 25) });
+    for (const e of r?.zaps?.edges || []) map.set(String(e.id), gqlZapRow(e));
+  }
+  return map;
 }
 
 export async function allRuns(login, v = {}, { max = 10000 } = {}) {

@@ -8,7 +8,7 @@
 //     'conflict': the Zap belongs to nobody, every involved client gets a warning, and it is excluded
 //     from every client's conclusions until clients.json is fixed.
 // clientZapIds and ownershipIndex read the same map, so they always agree.
-import { trpc, allZaps } from './lib.mjs';
+import { trpc, allZaps, allZapsGql, sessionGen } from './lib.mjs';
 import { loadRegistry } from './registry.mjs';
 
 // Flatten the nested folder tree into [{id, name, assetCount, parentId}].
@@ -68,6 +68,12 @@ async function folderZapIds(login, folder, { pageSize = 100, maxPages = 200 } = 
   return { ids, assets, readOk, warnings };
 }
 
+export const FOLDER_CONCURRENCY = 4;
+async function pool(items, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) await fn(items[i++]); }));
+}
+
 const childrenMap = (flat) => {
   const kids = new Map();
   for (const f of flat) kids.set(f.parentId, [...(kids.get(f.parentId) || []), f.id]);
@@ -100,35 +106,58 @@ function loginClients(target) {
   return { me, clients };
 }
 
-// The claim map: zapId -> owning client name, or { conflict: [names] }. Warnings are the target's.
-async function claimMap(target) {
-  const { login } = target;
-  const { me, clients } = loginClients(target);
-  const warnings = []; const warn = (w) => { if (!warnings.includes(w)) warnings.push(w); };
+// The claim map of one login: zapId -> owning client name, or { conflict: [names] }, plus every client's warnings.
+// It is the same for every client on the login, so it is built once and cached (see loginClaims below).
+async function buildClaims(login, clients) {
+  const all = [...clients.keys()];
+  const warnings = new Map(all.map((c) => [c, []]));
+  const warn = (who, w) => { for (const c of [who].flat()) { const l = warnings.get(c); if (l && !l.includes(w)) l.push(w); } };
+  let degraded = false;
   const anyFolders = [...clients.values()].some((c) => c.folderIds.length);
   const anyPrefixes = [...clients.values()].some((c) => c.namePrefixes.length);
-  const zaps = anyFolders || anyPrefixes ? (await allZaps(login)).results : [];
-  const zapIdSet = new Set(zaps.filter((z) => z.id != null).map((z) => String(z.id)));
+  // The Zap list (id, title): one trpc zap.searchZaps call (500 rows per page, ~1.5 s live). When the trpc token is
+  // expired and cannot be renewed, the reporting GraphQL ZapSearch (session auth, 25 per page, ~11 s for ~300 Zaps)
+  // is the fallback; it also carries each Zap's own folder, which the degraded folder claims below need.
+  let zaps = null; let zapsSource = null; let trpcRows = null; // trpcRows: the raw zap.searchZaps rows (list_zaps reuses them)
+  const gqlList = async () => {
+    const list = await allZapsGql(login);
+    zaps = list.results; zapsSource = 'graphql';
+    if (!list.complete) warn(all, `the account's Zap list stopped before its end (${zaps.length} of ${list.totalCount} read): Zaps beyond that are not claimed`);
+  };
+  if (anyFolders || anyPrefixes) {
+    try {
+      const list = await allZaps(login);
+      trpcRows = list.results;
+      zaps = list.results.filter((z) => z?.id != null).map((z) => ({ ...z, id: String(z.id) })); zapsSource = 'trpc';
+      if (zaps.length < list.count) warn(all, `the account's Zap list stopped before its end (${zaps.length} of ${list.count} read): Zaps beyond that are not claimed`);
+    } catch (e) {
+      if (e.code !== 'TRPC_TOKEN_EXPIRED') throw e;
+      await gqlList();
+    }
+  }
+  const zapIdSet = new Set((zaps ?? []).filter((z) => z.id != null).map((z) => String(z.id)));
 
   const folderClaims = new Map(); // zapId -> Map(client -> depth of its deepest mapped folder holding it)
   if (anyFolders) {
+   try {
     const flat = flattenTree(await trpc(login, 'folder.folderTree', {}));
     const byId = new Map(flat.map((f) => [f.id, f]));
     const kids = childrenMap(flat);
     const read = new Map(); // folderId -> promise of folderZapIds (each folder read once)
     const readFolder = (id) => { if (!read.has(id)) read.set(id, folderZapIds(login, byId.get(id))); return read.get(id); };
+    // Every mapped folder and its descendants, read FOLDER_CONCURRENCY at a time (one at a time took ~1 s each live).
+    const wanted = [...new Set([...clients.values()].flatMap((c) => c.folderIds.filter((r) => byId.has(r)).flatMap((r) => descendants(kids, r))))];
+    await pool(wanted, FOLDER_CONCURRENCY, readFolder);
     for (const [client, c] of clients) {
       for (const root of c.folderIds) {
-        if (!byId.has(root)) { if (client === me) warn(`folder ${root} not found in ${login}`); continue; }
+        if (!byId.has(root)) { warn(client, `folder ${root} not found in ${login}`); continue; }
         const depth = depthOf(byId, root);
         const sub = descendants(kids, root);
         for (const f of sub) {
           const r = await readFolder(f);
-          if (client === me) {
-            for (const w of r.warnings) warn(w);
-            const missing = r.ids.filter((z) => !zapIdSet.has(z)).length;
-            if (missing) warn(`folder ${f}: ${missing} folder Zaps not found in zap.searchZaps (deleted or not visible to this login?)`);
-          }
+          for (const w of r.warnings) warn(client, w);
+          const missing = r.ids.filter((z) => !zapIdSet.has(z)).length;
+          if (missing) warn(client, `folder ${f}: ${missing} folder Zaps not found in the account's Zap list (deleted or not visible to this login?)`);
           for (const z of r.ids) {
             const m = folderClaims.get(z) ?? new Map();
             m.set(client, Math.max(m.get(client) ?? -1, depth));
@@ -136,12 +165,10 @@ async function claimMap(target) {
           }
         }
         // The folder tree's assetCount counts the folder AND its subfolders (verified live 2026-11-12).
-        if (client === me) {
-          const reads = await Promise.all(sub.map(readFolder));
-          const total = reads.reduce((n, r) => n + r.assets, 0);
-          const ac = byId.get(root).assetCount;
-          if (reads.every((r) => r.readOk) && typeof ac === 'number' && ac !== total) warn(`folder ${root}: folder tree assetCount ${ac} (counts subfolders), folder and subfolder assets returned ${total}`);
-        }
+        const reads = await Promise.all(sub.map(readFolder));
+        const total = reads.reduce((n, r) => n + r.assets, 0);
+        const ac = byId.get(root).assetCount;
+        if (reads.every((r) => r.readOk) && typeof ac === 'number' && ac !== total) warn(client, `folder ${root}: folder tree assetCount ${ac} (counts subfolders), folder and subfolder assets returned ${total}`);
       }
     }
     // Nested mappings are legal (the deeper one wins) but worth saying, to every client involved.
@@ -150,11 +177,28 @@ async function claimMap(target) {
         for (let n = byId.get(byId.get(root)?.parentId); n; n = byId.get(n.parentId)) {
           for (const [other, o] of clients) {
             if (other === client || !o.folderIds.includes(n.id)) continue;
-            if (client === me || other === me) warn(`folder ${root} (${client}) is nested inside folder ${n.id} mapped to ${other}: the deeper mapping wins for Zaps in folder ${root}`);
+            warn([client, other], `folder ${root} (${client}) is nested inside folder ${n.id} mapped to ${other}: the deeper mapping wins for Zaps in folder ${root}`);
           }
         }
       }
     }
+   } catch (e) {
+    if (e.code !== 'TRPC_TOKEN_EXPIRED') throw e;
+    // Degrade honestly: the folder tree and folder assets are trpc-only. Each Zap's OWN folder is known from GraphQL,
+    // so a Zap sitting directly in a mapped folder is still claimed; Zaps in subfolders cannot be, and we say so.
+    degraded = true;
+    folderClaims.clear();
+    if (zapsSource !== 'graphql') await gqlList(); // a Zap's own folder is only in the GraphQL list
+    for (const [client, c] of clients) {
+      for (const root of c.folderIds) {
+        for (const z of zaps) {
+          if (z.folder?.id !== root) continue;
+          const m = folderClaims.get(z.id) ?? new Map(); m.set(client, 0); folderClaims.set(z.id, m);
+        }
+      }
+      if (c.folderIds.length) warn(client, `FOLDER READS FAILED (the trpc token expired and renewal was refused): the subfolders of folder ${c.folderIds.join(', folder ')} were NOT checked, and folders nested inside other clients' folders could not be resolved. ${client}'s Zaps are matched only by their own folder (GraphQL) and name prefixes, so this list can be incomplete. Run \`node login.mjs ${login}\` for a complete scope.`);
+    }
+   }
   }
 
   const prefixClaims = new Map(); // zapId -> Set(client)
@@ -180,10 +224,48 @@ async function claimMap(target) {
     else {
       const list = winners.sort();
       owner.set(z, { conflict: list });
-      if (list.includes(me)) warn(`zap ${z}: ${conflictLabel(list)}`);
+      warn(list, `zap ${z}: ${conflictLabel(list)}`);
     }
   }
-  return { me, owner, warnings };
+  return { owner, warnings, zaps, trpcRows: zapsSource === 'trpc' ? trpcRows : null, degraded, builtAt: new Date().toISOString() };
+}
+
+// Claim-map cache: one entry per login, reused for CLAIM_MAP_TTL_MS while its key is unchanged. The key is the
+// clients on that login with their folders and prefixes (so a clients.json edit that matters invalidates it) plus
+// the session generation (a new login.mjs session invalidates it). A degraded build (trpc token expired) is never
+// kept, so the first call after a re-login gets the full scope. Parallel callers share one build.
+export const CLAIM_MAP_TTL_MS = 5 * 60_000;
+const claimCache = new Map(); // login -> { key, at, promise, builtAt }
+export function _resetScopeCache() { claimCache.clear(); }
+const cacheKey = (login, clients) => JSON.stringify([sessionGen(login), [...clients].sort(([a], [b]) => (a < b ? -1 : 1))]);
+const fresh = (hit, key) => hit && hit.key === key && Date.now() - hit.at < CLAIM_MAP_TTL_MS;
+
+function loginClaims(login, clients) {
+  const key = cacheKey(login, clients);
+  const hit = claimCache.get(login);
+  if (fresh(hit, key)) return hit.promise;
+  const entry = { key, at: Date.now(), builtAt: null };
+  const drop = () => { if (claimCache.get(login) === entry) claimCache.delete(login); };
+  entry.promise = buildClaims(login, clients).then((b) => {
+    if (b.degraded) drop(); else entry.builtAt = b.builtAt;
+    return b;
+  }, (e) => { drop(); throw e; });
+  claimCache.set(login, entry);
+  return entry.promise;
+}
+
+// When the cached claim map for this target was built (ISO), or null when none is cached (or it was degraded).
+export function claimMapBuiltAt(target) {
+  const { clients } = loginClients(target);
+  const hit = claimCache.get(target.login);
+  return fresh(hit, cacheKey(target.login, clients)) ? hit.builtAt : null;
+}
+
+// The claim map from the target client's point of view: the login's owner map and this client's warnings.
+async function claimMap(target) {
+  const { me, clients } = loginClients(target);
+  const b = await loginClaims(target.login, clients);
+  return { me, owner: b.owner, zaps: b.zaps, trpcRows: b.trpcRows, builtAt: b.builtAt, warnings: [...(b.warnings.get(me) ?? [])] };
 }
 
 // Folder ids belonging to a client: its mapped folders and their descendants, minus any subtree that a
@@ -212,8 +294,10 @@ export async function clientZapIds(target) {
 }
 
 // Ownership of every Zap on the target's login, from the target client's point of view.
+// zaps = the unfiltered Zap list the map was built from (null when no client on the login has folders or prefixes);
+// trpcRows = the same list as raw zap.searchZaps rows when it came from trpc (else null).
 export async function ownershipIndex(target) {
-  const { me, owner, warnings } = await claimMap(target);
+  const { me, owner, warnings, zaps, trpcRows, builtAt } = await claimMap(target);
   const clientIds = [...owner].filter(([, o]) => o === me).map(([z]) => z);
   const ownershipOf = (zapId) => {
     // A run without a zap id must never fall through to login-wide via String(undefined).
@@ -224,5 +308,5 @@ export async function ownershipIndex(target) {
     if (o) return { ownership: 'other-client', label: LABELS.otherClient(o, target.client) };
     return { ownership: 'login-wide', label: LABELS.loginWide(target.login, target.client) };
   };
-  return { ownershipOf, clientIds, warnings };
+  return { ownershipOf, clientIds, warnings, zaps, trpcRows, builtAt };
 }

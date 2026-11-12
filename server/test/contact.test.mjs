@@ -9,6 +9,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zf-contact-'));
 process.env.ZAPIER_FACTORY_DIR = tmp;
 const { callTool } = await import('../tools.mjs');
 const { contactRuns } = await import('../contact.mjs');
+const { _resetScopeCache } = await import('../scope.mjs');
 
 const REG = {
   logins: { agency: { email: 'owner@agency.example', accountId: '1' } },
@@ -47,6 +48,7 @@ const DETAIL = {
 let gqlCalls, detailCalls;
 const realFetch = globalThis.fetch;
 beforeEach(() => {
+  _resetScopeCache?.();
   gqlCalls = []; detailCalls = 0;
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url);
@@ -59,7 +61,10 @@ beforeEach(() => {
     }
     if (u.includes('zap.searchZaps')) return json(wrap({ count: 3, next: null, results: [{ id: 1, title: 'BS intake' }, { id: 3, title: 'Other zap' }, { id: 5, title: 'Agency ops' }] }));
     if (u.includes('/api/reporting/graphql')) {
-      const v = JSON.parse(init.body).variables; gqlCalls.push(v);
+      const b = JSON.parse(init.body);
+      // Zap list for the claim map (GraphQL ZapSearch, live shape redacted): string ids, own folder in container.
+      if (b.operationName === 'ZapSearch') return json({ data: { zaps: { cursor: null, totalCount: 3, edges: [{ id: '1', title: 'BS intake', isEnabled: true, container: { id: '10', title: 'F' } }, { id: '3', title: 'Other zap', isEnabled: true, container: { id: '30', title: 'F' } }, { id: '5', title: 'Agency ops', isEnabled: false, container: { id: 'root', title: 'F' } }] } } });
+      const v = b.variables; gqlCalls.push(v);
       const rows = v.zapIds ? RUNS.filter((r) => v.zapIds.includes(r.zap?.id)) : RUNS;
       return json({ data: { zapRuns: { totalCount: rows.length, totalActionable: 0, edges: rows.slice(v.offset, v.offset + v.limit) } } });
     }
@@ -79,7 +84,7 @@ const target = () => ({ login: 'agency', accountId: '1', client: 'client-a', fol
 
 test('run in both searches appears once as client; sorted ascending; partial email dropped', async () => {
   const r = await contactRuns(target(), { email: 'jane@acme.com' });
-  assert.equal(r.client, 'client-a');
+  assert.ok(!('client' in r)); // the tool output carries it once, in scope.client
   assert.deepEqual(r.runs.map((x) => x.runId), ['r1', 'r5', 'r3']);
   assert.equal(r.runs[0].ownership, 'client');
   assert.equal(r.runs[0].zapTitle, 'BS intake');
@@ -190,4 +195,13 @@ test('phone search runs the 3 live-proven query forms on both scopes and unions 
   }
   assert.deepEqual(r.runs.map((x) => x.runId), ['r7']);
   assert.equal(detailCalls, new Set(RUNS.map((x) => x.id)).size, 'each candidate run fetched once');
+});
+
+// ---- loop r2 M-2: one client field (scope.client) and the matched count next to the not-matched count ----
+test('contact_runs tool output has scope.client only, and says how many candidates matched', async () => {
+  const r = await callTool('contact_runs', { client: 'client-a', email: 'jane@acme.com' });
+  assert.equal(r.scope.client, 'client-a');
+  assert.ok(!('client' in r));
+  assert.ok(r.warnings.includes('3 of 6 candidate runs matched the exact contact'), JSON.stringify(r.warnings));
+  assert.ok(r.warnings.some((x) => /^2 of 6 candidate runs did not contain the exact contact/.test(x)));
 });

@@ -85,7 +85,10 @@ export async function contactRuns(target, { email, phone, periodStart, periodEnd
   });
   const failed = checked.filter((c) => c.failed).length;
   const notContaining = checked.filter((c) => !c.ok && !c.failed).length;
-  if (checked.length) warnings.push(`${notContaining} of ${checked.length} candidate runs did not contain the exact contact${failed ? ` (${failed} could not be checked)` : ''}`);
+  if (checked.length) {
+    warnings.push(`${checked.filter((c) => c.ok).length} of ${checked.length} candidate runs matched the exact contact`);
+    warnings.push(`${notContaining} of ${checked.length} candidate runs did not contain the exact contact${failed ? ` (${failed} could not be checked)` : ''}`);
+  }
 
   const runs = checked.filter((c) => c.ok).map(({ e }) => {
     const zapId = e.zap?.id == null || String(e.zap.id).trim() === '' ? null : String(e.zap.id);
@@ -94,5 +97,5 @@ export async function contactRuns(target, { email, phone, periodStart, periodEnd
   }).sort((a, b) => String(a.startTime).localeCompare(String(b.startTime)));
 
   // warnings and window first: output truncation must never cut them.
-  return { warnings, window, client: target.client, runs };
+  return { warnings, window, runs };
 }

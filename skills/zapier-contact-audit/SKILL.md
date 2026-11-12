@@ -38,8 +38,9 @@ If the client is not in the registry, use the zapier-connect skill first.
    one; a phone needs at least 10 digits) and merge by `runId`. Each run carries `runId`, `zapId`,
    `zapTitle`, `startTime` (UTC), `status`, `ownership` and `label`. The result starts with `warnings` and
    `window`: read every warning and carry into the report any retention, cap (skipped startTime range),
-   failed-detail, "N of M candidate runs did not contain the exact contact", conflict or phone-recall
-   warning.
+   failed-detail, "N of M candidate runs matched the exact contact" / "N of M candidate runs did not contain
+   the exact contact", conflict, `FOLDER READS FAILED` (client scope incomplete: say so) or phone-recall
+   warning. The client is in `scope.client`.
    - `ownership: "client"` = the client's Zap. `login-wide` = `"<login>-wide Zap, not <client>'s"`: show it,
      labelled, but do not draw client conclusions from it alone. `other-client` = another client's Zap:
      list it as excluded, never mix its data in. `conflict` = two clients claim the Zap: list it as

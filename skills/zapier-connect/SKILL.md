@@ -69,6 +69,13 @@ client (e.g. `uxie-ghl-internal-mcp`, `uxie-ghl-internal-mcp-client-b`).
 **Re-login on `SESSION_EXPIRED`:** any tool can return it. Run step 2 for that login (same email), then
 `zapier_whoami`, then retry the call that failed once. If it fails the same way, stop and report it.
 
+**The trpc token (`trpc_token` in `zapier_whoami`).** Folders, folder assets, the trpc Zap list, connections and
+tables use a ~15-minute token that the server renews by itself with the zapier.com app's own
+`POST /api/v4/jwt/refresh` (the plugin's only non-read call; it changes no Zap, run or setting). A result that
+renewed it carries `"renewed at <time>"` in `warnings`; nothing to do. `TRPC_TOKEN_EXPIRED` means the renewal was
+refused: runs, run detail and the GraphQL/REST tools still work; re-login (step 2) for the rest. Client scope then
+warns `FOLDER READS FAILED` (subfolders unchecked): say the client's Zap list may be incomplete.
+
 **Mismatch** (`match: false`): the saved session is a different email or account than the registry.
 Show both values to the user and ask which is right. Do not switch accounts in Zapier to "fix" it
 (switching is a write and is blocked).

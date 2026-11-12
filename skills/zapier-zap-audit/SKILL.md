@@ -42,7 +42,9 @@ why. **Nothing is edited, replayed, published or turned on/off.**
    when relevant). Default window is now-60d to now+1d; keep `periodEnd` in the future. Use `all: true` to
    page; quote `totalCount` (caps at 10,000; say so if hit). For oldest-first or `stop_reason` /
    `held_reason` in the list itself, use `list_runs_rest` with `zap_ids`, `statuses` and
-   `order_by: "start_time"`.
+   `order_by: "start_time"` (rows under `results`, compact; `trigger_title` there is the trigger step's title,
+   not the Zap's). UI "Running" = status `pending`.
+   Task use: `task_usage` with `client` and `zapIds: ["<id>"]` (billable tasks in the window, by date).
    Also count successes in the same window (`status: ["success"]`) so the failure rate is exact.
 4. **Why each failed.** `get_run` per run (`full: true` only when the data matters):
    - Filter stop: `stop_reason.rule_dumps` (which rule, which value).

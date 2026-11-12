@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { assertReadOnly, applySetCookie, buildZapRunsQuery, request } from '../lib.mjs';
+import { assertReadOnly, applySetCookie, buildZapRunsQuery, request, RUN_STATUSES } from '../lib.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const GQL = 'https://zapier.com/api/reporting/graphql';
@@ -75,4 +75,24 @@ test('cli without a session file prints SESSION_EXPIRED + login hint', () => {
   assert.equal(r.status, 1);
   assert.match(r.stderr, /SESSION_EXPIRED/);
   assert.match(r.stderr, /node login\.mjs/);
+});
+
+// loop r2 I-2: ZapRuns variable types are the UI's own (history bundle ZapRuns text), proven live 2026-11-12.
+test('ZapRuns declares the UI variable types (heldReasons [HeldReason!], heldStaleAuthIds [String!], ...)', () => {
+  const t = buildZapRunsQuery({ accountId: '1', apps: ['A'], channel: 'c', channelError: 'e', customuserIds: ['2'], heldReasons: ['x'], heldStaleAuthIds: ['3'] });
+  for (const d of ['$apps: [String!]', '$channel: String', '$channelError: String', '$customuserIds: [ID!]', '$heldReasons: [HeldReason!]', '$heldStaleAuthIds: [String!]']) assert.ok(t.includes(d), d);
+});
+
+// loop r2 I-6: UI "Running" = pending; pending and skipped are accepted by GraphQL and REST (live 2026-11-12).
+test('run statuses include pending (UI Running) and skipped, not running/replay/playing', () => {
+  for (const x of ['pending', 'skipped']) assert.ok(RUN_STATUSES.includes(x), x);
+  for (const x of ['running', 'replay', 'playing']) assert.ok(!RUN_STATUSES.includes(x), x);
+});
+
+// loop r2 I-3: the UI's apps query puts the fragment first, which the guard refuses; the tool sends it after the query.
+test('guard: fragment-first text is refused; the list_apps text (fragment after query) passes', async () => {
+  const { APPS_QUERY, TASK_USAGE_QUERY } = await import('../tools.mjs');
+  rejects(() => assertReadOnly('POST', GQL, q('fragment AppResult on App { id } query A { a }')));
+  assert.equal(assertReadOnly('POST', GQL, q(APPS_QUERY)), true);
+  assert.equal(assertReadOnly('POST', GQL, q(TASK_USAGE_QUERY)), true);
 });
