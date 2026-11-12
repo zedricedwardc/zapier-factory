@@ -1,0 +1,21 @@
+{
+  "name": "zapier-factory-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "READ-ONLY Zapier internal API MCP server (one browser session per Zapier login).",
+  "main": "server.mjs",
+  "scripts": {
+    "login": "node login.mjs",
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "playwright": "1.63.0",
+    "zod": "4.6.7"
+  }
+}

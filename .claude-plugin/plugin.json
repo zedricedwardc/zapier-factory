@@ -1,0 +1,8 @@
+{
+  "name": "zapier-factory",
+  "version": "0.1.0",
+  "description": "Read-only Zapier internal API MCP + audit skills",
+  "author": {
+    "name": "Owner"
+  }
+}

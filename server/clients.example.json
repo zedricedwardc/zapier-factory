@@ -1,0 +1,14 @@
+{
+  "logins": {
+    "agency": { "email": "owner@agency.example", "accountId": "10000001" },
+    "client-b": { "email": "support@client-b.example", "accountId": null }
+  },
+  "clients": {
+    "client-a": {
+      "login": "agency",
+      "folderIds": ["0100000a-0000-0000-0000-000000000001"],
+      "namePrefixes": ["Client A"],
+      "ghl": { "server": "uxie-ghl-internal-mcp", "locationIds": [] }
+    }
+  }
+}
